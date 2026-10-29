@@ -1,5 +1,5 @@
 import os
-import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -8,9 +8,8 @@ import streamlit as st
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "sareesaathi.db"
-CURRENCY = "₹"
 
-st.set_page_config(page_title="SareeSaathi AI", page_icon="🪷", layout="wide")
+st.set_page_config(page_title="SareeSaathi AI", page_icon="🪷", layout="centered")
 
 # ---------- Database ----------
 def db():
@@ -45,332 +44,386 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        if count == 0:
+        if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
             conn.executemany("""
                 INSERT INTO products (name, category, color, price, stock, description)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, [
                 ("Kanchipuram Silk Saree", "Silk", "Maroon", 6499, 5, "Traditional zari border; festive and wedding wear."),
-                ("Soft Cotton Saree", "Cotton", "Mustard", 1299, 12, "Lightweight everyday wear with a simple woven border."),
+                ("Soft Cotton Saree", "Cotton", "Mustard", 1299, 12, "Lightweight everyday wear with a woven border."),
                 ("Banarasi Style Saree", "Festive", "Royal Blue", 3899, 4, "Rich brocade-inspired design for celebrations."),
                 ("Printed Daily Wear Saree", "Printed", "Teal", 899, 15, "Comfortable printed saree for everyday use."),
-                ("Organza Party Wear Saree", "Party Wear", "Lavender", 2799, 6, "Lightweight sheer-look fabric with decorative detailing."),
+                ("Organza Party Wear Saree", "Party Wear", "Lavender", 2799, 6, "Lightweight party wear with decorative detailing."),
             ])
 
-def get_products():
+def products_all():
     with db() as conn:
-        return conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
+        return conn.execute("SELECT * FROM products ORDER BY id").fetchall()
 
-def get_orders():
+def orders_all(limit=50):
     with db() as conn:
-        return conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+        return conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
-def create_order(product, quantity, customer_name, phone, address):
+def get_product(product_id):
     with db() as conn:
-        row = conn.execute("SELECT * FROM products WHERE id = ?", (int(product["id"]),)).fetchone()
-        if not row:
-            return False, "That product could not be found."
-        if int(quantity) < 1:
-            return False, "Quantity must be at least 1."
-        if row["stock"] < int(quantity):
-            return False, f"Only {row['stock']} item(s) are currently in demo stock."
-        conn.execute("""
+        return conn.execute("SELECT * FROM products WHERE id=?", (int(product_id),)).fetchone()
+
+def save_order(product, qty, name, phone, address):
+    with db() as conn:
+        current = conn.execute("SELECT * FROM products WHERE id=?", (int(product["id"]),)).fetchone()
+        if not current:
+            return False, "I couldn't find that product anymore."
+        if int(qty) < 1 or int(current["stock"]) < int(qty):
+            return False, f"Sorry, only {current['stock']} item(s) are in stock right now."
+        cur = conn.execute("""
             INSERT INTO orders
             (product_id, product_name, quantity, unit_price, customer_name, phone, address, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            row["id"], row["name"], int(quantity), row["price"], customer_name.strip(),
-            phone.strip(), address.strip(), "Demo order - payment not processed",
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ))
-        conn.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (int(quantity), row["id"]))
-    return True, "Demo order created. No payment was taken."
+        """, (current["id"], current["name"], int(qty), current["price"], name, phone, address,
+              "Demo order - payment not processed", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        order_id = cur.lastrowid
+        conn.execute("UPDATE products SET stock=stock-? WHERE id=?", (int(qty), current["id"]))
+    return True, f"Your demo order #{order_id} is booked for **{current['name']}**. Total: ₹{current['price'] * int(qty):,.0f}. No payment was taken."
 
-init_db()
+def norm(s):
+    s = (s or "").lower().strip()
+    replacements = {
+        "sarees": "saree", "saris": "saree", "irukka": " available ",
+        "irukku": " available ", "irukkா": " available ", "stock la": " stock ",
+        "enna enna": " which ", "kaamikka": " show ", "kaatu": " show ",
+        "vilai": " price ", "evlo": " price ", "venum": " want ",
+        "vaanguren": " buy ", "order pannunga": " order ",
+    }
+    for a, b in replacements.items():
+        s = s.replace(a, b)
+    return re.sub(r"\s+", " ", s)
 
-# ---------- AI intent helper ----------
-def configured_api_key():
-    # Streamlit Cloud secrets are supported; environment variables work locally.
+def detect_role(text):
+    t = norm(text)
+    if any(x in t for x in ["i am vendor", "i'm vendor", "vendor", "shop owner", "seller", "my shop", "naan vendor", "kadaikaar"]):
+        return "Vendor"
+    if any(x in t for x in ["customer", "buyer", "shopping", "i want to buy", "i am customer", "naan customer"]):
+        return "Customer"
+    return None
+
+def money(n):
+    return f"₹{float(n):,.0f}"
+
+def find_products(text):
+    t = norm(text)
+    ps = list(products_all())
+    color_map = {
+        "blue": ["blue"], "maroon": ["maroon"], "mustard": ["mustard", "yellow"],
+        "teal": ["teal", "green"], "lavender": ["lavender", "purple"],
+        "red": ["red", "maroon"], "pink": ["pink"],
+    }
+    colors = [c for c, terms in color_map.items() if any(x in t for x in terms)]
+    category_map = {
+        "silk": ["silk", "kanchipuram"], "cotton": ["cotton"],
+        "festive": ["festive", "banarasi"], "printed": ["printed", "print"],
+        "party": ["party", "organza"],
+    }
+    cats = [c for c, terms in category_map.items() if any(x in t for x in terms)]
+    budget = None
+    m = re.search(r"(?:under|below|less than|within|budget(?: of)?)\s*₹?\s*([0-9,]+)", t)
+    if not m:
+        m = re.search(r"(?:₹|rs\.?\s*)([0-9,]+)", t)
+        if m and any(w in t for w in ["under", "below", "budget", "less than", "within"]):
+            pass
+        else:
+            m = None
+    if m:
+        try:
+            budget = float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    if colors:
+        ps = [p for p in ps if any(c in p["color"].lower() for c in colors)]
+    if cats:
+        ps = [p for p in ps if any(c in p["category"].lower() or c in p["name"].lower() for c in cats)]
+    if budget is not None:
+        ps = [p for p in ps if float(p["price"]) <= budget]
+    return ps
+
+def product_lines(ps):
+    if not ps:
+        return "I couldn't find a matching saree in our current sample catalog. You can ask for blue, maroon, silk, cotton, or a budget like 'under ₹3000'."
+    lines = ["Here are the matching options:"]
+    for i, p in enumerate(ps[:8], 1):
+        stock = f"{p['stock']} in stock" if p["stock"] > 0 else "currently out of stock"
+        lines.append(f"{i}. **{p['name']}** — {money(p['price'])} · {p['color']} · {stock}")
+    lines.append("If you'd like one, just say **“I want the blue one”** or **“Order the Banarasi saree”**. I'll guide you here in the chat.")
+    return "\n\n".join(lines)
+
+def openai_assist(user_text, role):
+    # Optional conversational explanation. Database actions are handled separately and validated in Python.
     key = os.getenv("OPENAI_API_KEY", "").strip()
-    if key:
-        return key
+    if not key:
+        try:
+            key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+        except Exception:
+            key = ""
+    if not key:
+        return None
     try:
-        return str(st.secrets.get("OPENAI_API_KEY", "")).strip()
-    except Exception:
-        return ""
-
-def ai_reply(user_text, role, products, orders):
-    api_key = configured_api_key()
-    try:
-        if not api_key:
-            return demo_reply(user_text, role, products, orders), "Demo mode"
         from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        product_data = [
-            {"id": p["id"], "name": p["name"], "category": p["category"],
-             "color": p["color"], "price": p["price"], "stock": p["stock"],
-             "description": p["description"]} for p in products
-        ]
-        order_data = [
-            {"id": o["id"], "product": o["product_name"], "quantity": o["quantity"],
-             "customer": o["customer_name"], "status": o["status"], "created_at": o["created_at"]}
-            for o in orders[:20]
-        ]
-        system = f"""
-You are SareeSaathi, a helpful conversational assistant for a small saree business.
-Current role: {role}.
-Users can speak naturally; do not demand special commands.
-Explain products and help the user decide what to do. Be concise and friendly.
-This prototype can show products, create demo orders through the UI, and let vendors manage stock through the UI.
-Never claim you changed stock, created an order, charged money, or sent a WhatsApp message unless the UI actually did it.
-Payments are NOT integrated. Do not request card details, UPI PINs, passwords, or OTPs.
-Only use this product data and order summary; do not invent stock, prices, or order records.
-Product data: {json.dumps(product_data, ensure_ascii=False)}
-Recent orders: {json.dumps(order_data, ensure_ascii=False)}
-"""
+        client = OpenAI(api_key=key)
+        catalog = [{"name": p["name"], "color": p["color"], "price": p["price"], "stock": p["stock"], "category": p["category"]} for p in products_all()]
         response = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_text[:2000]},
+                {"role": "system", "content": (
+                    "You are SareeSaathi, a warm, concise conversational sales assistant for local saree vendors. "
+                    f"The current role is {role}. Reply in the user's language style when possible, including Tamil-English transliteration. "
+                    "This prototype has sample products and demo orders only. Do not claim to have performed a database action, booked an order, taken payment, or sent WhatsApp messages. "
+                    "Never request OTPs, UPI PINs, card numbers, or passwords. If an action is needed, guide them naturally in this same chat. "
+                    f"Current sample catalog: {catalog}"
+                )},
+                {"role": "user", "content": user_text[:1500]}
             ],
             temperature=0.4,
-            max_tokens=350,
+            max_tokens=220,
         )
-        return response.choices[0].message.content.strip(), "OpenAI mode"
-    except Exception as exc:
-        # Keep the app usable if API key/config is wrong; avoid exposing internals.
-        return demo_reply(user_text, role, products, orders) + "\n\n(Using demo fallback because AI service is unavailable.)", "Demo fallback"
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return None
 
+def handle_message(raw):
+    text = norm(raw)
+    role = st.session_state.role
+    state = st.session_state.flow
 
-def demo_reply(user_text, role, products, orders):
-    # Lightweight multilingual/transliterated keyword matching for safe demo mode.
-    text = user_text.lower().strip()
-    normalized = (
-        text.replace("sarees", "saree")
-            .replace("saris", "saree")
-            .replace("irukka", " available ")
-            .replace("irukku", " available ")
-            .replace("irukkா", " available ")
-            .replace("stock la", " stock ")
-            .replace("enna enna", " which ")
-            .replace("evlo", " price ")
-            .replace("vilai", " price ")
-            .replace("kaamikka", " show ")
-            .replace("kaatu", " show ")
-    )
+    # Role selection through conversation, not a separate screen.
+    if role is None:
+        detected = detect_role(raw)
+        if detected:
+            st.session_state.role = detected
+            return f"Great, I'll help you as a **{detected.lower()}**. You can tell me what you need in your own words."
+        return "Vanakkam! I'm SareeSaathi. Are you here as a **customer** looking for sarees, or a **vendor** managing your shop? Just reply naturally — for example, “I'm a customer” or “I manage the shop.”"
 
-    # Stock/inventory requests should summarize the current catalog.
-    stock_intent = any(w in normalized for w in [
-        "stock", "inventory", "available", "what do we have", "which saree", "all saree"
-    ])
-    if role == "Vendor" and any(w in normalized for w in ["order", "sales", "customer"]):
-        return (
-            f"You have **{len(orders)} demo order(s)** recorded.\n\n"
-            "Open the Vendor dashboard to review orders and update inventory. "
-            "In demo mode, I won't modify records based only on chat."
-        )
-
-    # Detect an explicit color/product/category request.
-    color_terms = {
-        "blue": ["blue"],
-        "maroon": ["maroon"],
-        "mustard": ["mustard", "yellow"],
-        "teal": ["teal", "green"],
-        "lavender": ["lavender", "purple"],
-    }
-    requested_colors = [color for color, terms in color_terms.items()
-                        if any(term in normalized for term in terms)]
-    category_terms = {
-        "silk": ["silk", "kanchipuram"],
-        "cotton": ["cotton"],
-        "festive": ["festive", "banarasi"],
-        "printed": ["printed", "print"],
-        "party wear": ["party wear", "organza"],
-    }
-    requested_categories = [cat for cat, terms in category_terms.items()
-                            if any(term in normalized for term in terms)]
-
-    # Recognize simple budget phrasing, including "under 5000" / "below 2000".
-    import re
-    budget = None
-    match = re.search(r"(?:under|below|less than|within|budget(?: of)?|under rs\.?|under ₹)\s*₹?\s*([0-9,]+)", normalized)
-    if match:
-        try:
-            budget = float(match.group(1).replace(",", ""))
-        except ValueError:
-            budget = None
-    if budget is None:
-        match = re.search(r"(?:₹|rs\.?\s*)([0-9,]+)", normalized)
-        if match and any(w in normalized for w in ["under", "below", "budget", "less than", "within"]):
-            try:
-                budget = float(match.group(1).replace(",", ""))
-            except ValueError:
-                pass
-
-    matches = list(products)
-    if requested_colors:
-        matches = [p for p in matches if any(c in p["color"].lower() for c in requested_colors)]
-    if requested_categories:
-        matches = [p for p in matches if any(c in p["category"].lower() or c in p["name"].lower()
-                                               for c in requested_categories)]
-    if budget is not None:
-        matches = [p for p in matches if float(p["price"]) <= budget]
-
-    product_intent = any(w in normalized for w in [
-        "saree", "product", "show", "catalog", "price", "silk", "cotton",
-        "blue", "maroon", "mustard", "teal", "lavender", "available", "stock",
-        "under", "budget", "organza", "banarasi", "printed"
-    ])
-
-    if product_intent or stock_intent:
-        if not matches:
-            return "I couldn't find a matching saree in the current demo catalog. Try asking for blue, maroon, silk, cotton, or a budget such as 'under ₹3000'."
-        if not stock_intent and not requested_colors and not requested_categories and budget is None:
-            matches = matches[:5]
-        lines = ["Here are the matching sarees in the current demo catalog:"]
-        for p in matches[:10]:
-            stock_label = "In stock" if int(p["stock"]) > 0 else "Out of stock"
-            lines.append(
-                f"- **{p['name']}** — ₹{p['price']:,.0f} | Color: {p['color']} | "
-                f"Stock: {p['stock']} ({stock_label})"
+    # Continue an order conversation.
+    if state and state.get("kind") == "order":
+        step = state.get("step")
+        if any(x in text for x in ["cancel", "stop order", "never mind"]):
+            st.session_state.flow = None
+            return "No problem — I've cancelled this demo order flow. What else can I help with?"
+        if step == "confirm_product":
+            candidates = state.get("candidates", [])
+            chosen = None
+            if text.isdigit():
+                idx = int(text) - 1
+                if 0 <= idx < len(candidates):
+                    chosen = get_product(candidates[idx])
+            else:
+                for pid in candidates:
+                    p = get_product(pid)
+                    if p and (p["name"].lower() in text or any(word in text for word in p["name"].lower().split() if len(word) > 4)):
+                        chosen = p
+                        break
+                if not chosen and len(candidates) == 1:
+                    chosen = get_product(candidates[0])
+            if not chosen:
+                return "Which one would you like? Reply with the product name or its number from the list. You can also say 'cancel'."
+            if chosen["stock"] <= 0:
+                st.session_state.flow = None
+                return f"Sorry, **{chosen['name']}** is currently out of stock. Would you like me to find a similar option?"
+            state["product_id"] = chosen["id"]
+            state["step"] = "quantity"
+            st.session_state.flow = state
+            return f"Great choice — **{chosen['name']}** is {money(chosen['price'])}. How many would you like?"
+        if step == "quantity":
+            m = re.search(r"\d+", text)
+            if not m:
+                return "How many would you like? Please tell me a quantity, such as 1 or 2."
+            qty = int(m.group())
+            p = get_product(state["product_id"])
+            if not p or qty < 1 or qty > int(p["stock"]):
+                return f"That quantity isn't available. Current stock is {p['stock'] if p else 0}. How many would you like?"
+            state["quantity"] = qty
+            state["step"] = "name"
+            st.session_state.flow = state
+            return "Sure. What name should I put on the demo order?"
+        if step == "name":
+            if len(raw.strip()) < 2:
+                return "Could you tell me the name for the order?"
+            state["customer_name"] = raw.strip()[:100]
+            state["step"] = "phone"
+            st.session_state.flow = state
+            return "Thanks. What's a contact number for this demo order? Please use fictional details while testing."
+        if step == "phone":
+            digits = re.sub(r"\D", "", raw)
+            if len(digits) < 6:
+                return "That number seems too short. Please enter a test contact number with at least 6 digits."
+            state["phone"] = raw.strip()[:40]
+            state["step"] = "address"
+            st.session_state.flow = state
+            return "What's the delivery address for this demo order? Use a fictional address for testing."
+        if step == "address":
+            if len(raw.strip()) < 5:
+                return "Please provide a little more detail for the delivery address."
+            state["address"] = raw.strip()[:400]
+            state["step"] = "confirm"
+            st.session_state.flow = state
+            p = get_product(state["product_id"])
+            total = float(p["price"]) * int(state["quantity"])
+            return (
+                f"Please confirm your demo order:\\n\\n**{p['name']}** × {state['quantity']}\\n\\n"
+                f"Total: **{money(total)}**\\n\\nDelivery to: {state['address']}\\n\\n"
+                "Reply **confirm** to book this test order, or **cancel** to stop. **No payment will be taken.**"
             )
-        lines.append("\nTo book one, open **Place demo order** and select the product. No payment is processed.")
-        return "\n\n".join(lines)
+        if step == "confirm":
+            if any(x in text for x in ["confirm", "yes", "ok", "okay", "book it", "proceed"]):
+                p = get_product(state["product_id"])
+                ok, result = save_order(p, state["quantity"], state["customer_name"], state["phone"], state["address"])
+                st.session_state.flow = None
+                return result if ok else result
+            return "I haven't booked it yet. Reply **confirm** to create the demo order, or **cancel** to stop."
 
-    if any(w in normalized for w in ["buy", "order", "purchase", "delivery", "address"]):
-        return "I can help you choose a saree. Open **Product catalog**, then **Place demo order** to enter delivery details and create a demo order. Payment is not enabled."
+    # Vendor commands: only explicit, validated edits mutate the database.
+    if role == "Vendor":
+        stock_match = re.search(r"(?:add|increase|update|set|change)\s+(\d+)\s+.*?(?:stock|to stock)\s+(?:of\s+)?(.+)", text)
+        if not stock_match:
+            stock_match = re.search(r"(?:set|change|update)\s+stock\s+(?:of\s+)?(.+?)\s+(?:to|as)\s+(\d+)", text)
+            if stock_match:
+                product_phrase, amount = stock_match.group(1), int(stock_match.group(2))
+            else:
+                product_phrase, amount = None, None
+        else:
+            amount, product_phrase = int(stock_match.group(1)), stock_match.group(2)
+        if product_phrase:
+            ps = list(products_all())
+            matches = [p for p in ps if product_phrase.strip() in p["name"].lower() or product_phrase.strip() in p["color"].lower()]
+            if len(matches) == 1:
+                p = matches[0]
+                with db() as conn:
+                    conn.execute("UPDATE products SET stock=? WHERE id=?", (max(0, amount), p["id"]))
+                return f"Done — I've set **{p['name']}** stock to **{max(0, amount)}** in the demo database."
+            if len(matches) > 1:
+                return "I found more than one match: " + ", ".join(p["name"] for p in matches) + ". Which product do you mean?"
+        price_match = re.search(r"(?:change|set|update)\s+(?:the\s+)?price\s+(?:of\s+)?(.+?)\s+(?:to|at)\s*₹?\s*([0-9,]+)", text)
+        if price_match:
+            phrase, amount = price_match.group(1).strip(), float(price_match.group(2).replace(",", ""))
+            matches = [p for p in products_all() if phrase in p["name"].lower() or phrase in p["color"].lower()]
+            if len(matches) == 1:
+                p = matches[0]
+                with db() as conn:
+                    conn.execute("UPDATE products SET price=? WHERE id=?", (amount, p["id"]))
+                return f"Done — **{p['name']}** is now listed at **{money(amount)}** in the demo database."
+            if len(matches) > 1:
+                return "I found multiple products matching that. Please include more of the product name."
+        if any(x in text for x in ["orders", "sales", "customer", "order list", "how many order"]):
+            os_ = list(orders_all())
+            if not os_:
+                return "There are no demo orders yet. Once a customer completes an order in this chat, I'll be able to show it here."
+            lines = [f"I found **{len(os_)} recent demo order(s)**:"]
+            for o in os_[:8]:
+                lines.append(f"- Order #{o['id']}: {o['product_name']} × {o['quantity']} — {o['customer_name']} — {o['status']}")
+            return "\n".join(lines)
+        if any(x in text for x in ["stock", "inventory", "available", "saree", "catalog", "product"]):
+            return product_lines(list(products_all()))
+        if any(x in text for x in ["customer", "vendor", "help", "what can you do"]):
+            return "You can ask me to check stock, change a product price, update stock, or review demo orders. For example: “Set stock of blue saree to 10” or “Change price of Banarasi saree to ₹3499.”"
+
+    # Customer product discovery.
+    if any(x in text for x in ["saree", "show", "blue", "maroon", "silk", "cotton", "price", "available", "stock", "under", "budget", "organza", "banarasi", "printed", "purple", "lavender", "green", "red"]):
+        ps = find_products(raw)
+        st.session_state.last_product_ids = [p["id"] for p in ps]
+        if any(x in text for x in ["buy", "order", "want", "book", "purchase"]):
+            if not ps:
+                return product_lines(ps)
+            if len(ps) == 1:
+                p = ps[0]
+                if p["stock"] <= 0:
+                    return f"Sorry, **{p['name']}** is out of stock. Would you like another option?"
+                st.session_state.flow = {"kind": "order", "step": "quantity", "product_id": p["id"]}
+                return f"Of course! **{p['name']}** costs {money(p['price'])} and has {p['stock']} in stock. How many would you like?"
+            st.session_state.flow = {"kind": "order", "step": "confirm_product", "candidates": [p["id"] for p in ps[:8]]}
+            return product_lines(ps) + "\n\nTell me the product name or number to start your order."
+        return product_lines(ps)
+
+    if any(x in text for x in ["buy", "order", "purchase", "i want one"]):
+        last_ids = st.session_state.get("last_product_ids", [])
+        available = [get_product(pid) for pid in last_ids]
+        available = [p for p in available if p]
+        if len(available) == 1:
+            p = available[0]
+            st.session_state.flow = {"kind": "order", "step": "quantity", "product_id": p["id"]}
+            return f"Let's order **{p['name']}** at {money(p['price'])}. How many would you like?"
+        return "Of course. Which saree would you like to order? Tell me its color or name, and I'll guide you through the order here."
+
+    ai = openai_assist(raw, role)
+    if ai:
+        return ai
     return (
-        "Vanakkam! I'm SareeSaathi, your demo sales assistant. You can ask in simple English or Tamil-English, "
-        "for example:\n\n"
-        "- Which sarees are in stock?\n"
-        "- Blue saree irukka?\n"
-        "- Show silk sarees under ₹5000\n\n"
-        "This is rule-based demo mode; add an OpenAI API key to enable AI-powered intent understanding."
+        "I can help with that. Tell me a little more in your own words. "
+        "For example, a customer can ask for a color, style, or budget; a vendor can ask about stock, prices, or orders. "
+        "This demo uses sample data and doesn't process real payments or send WhatsApp messages."
     )
 
-# ---------- UI ----------
+init_db()
+
+# ---------- Chat-only interface ----------
 st.markdown("""
 <style>
-.block-container {padding-top: 1.8rem; max-width: 1200px;}
-.hero {padding: 1.4rem 1.6rem; border-radius: 18px; background: linear-gradient(120deg, #fff1f2, #fff7ed); border: 1px solid #f3d7d9;}
-.small-muted {color: #6b7280; font-size: 0.92rem;}
+.block-container {max-width: 900px; padding-top: 1.4rem; padding-bottom: 2rem;}
+.hero {padding: 1.35rem 1.5rem; border-radius: 18px; background: linear-gradient(120deg,#fff1f2,#fff7ed); border: 1px solid #f0d3d7; margin-bottom: 1rem;}
+.hero h1 {color:#6d2138 !important; margin:0; font-size:2rem;}
+.hero p {color:#55333c !important; margin-top:.45rem;}
+div[data-testid="stChatMessage"] {border-radius: 14px;}
+div[data-testid="stChatInput"] textarea {font-size: 1rem;}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><h1>🪷 SareeSaathi AI</h1><p>Natural conversations for local saree businesses — from product discovery to demo order booking.</p><p class="small-muted">MVP prototype • Sample catalog • No real payments or WhatsApp messages</p></div>', unsafe_allow_html=True)
-st.write("")
+st.markdown("""
+<div class="hero">
+  <h1>🪷 SareeSaathi AI</h1>
+  <p>Your conversational sales assistant for local saree businesses.</p>
+  <p><b>Just tell me what you need.</b> No menus, special commands, or separate dashboards.</p>
+</div>
+""", unsafe_allow_html=True)
 
-products = get_products()
-orders = get_orders()
+if "role" not in st.session_state:
+    st.session_state.role = None
+if "flow" not in st.session_state:
+    st.session_state.flow = None
+if "last_product_ids" not in st.session_state:
+    st.session_state.last_product_ids = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = [{
+        "role": "assistant",
+        "content": "Vanakkam! I'm SareeSaathi. Are you here as a **customer** looking for sarees, or a **vendor** managing your shop? Just tell me naturally."
+    }]
 
-col1, col2 = st.columns([1, 2])
-with col1:
-    role = st.radio("Who are you today?", ["Customer", "Vendor"], horizontal=True)
-with col2:
-    st.info("Talk naturally. For example: “Show me silk sarees under ₹5,000” or “How many orders have we received?”")
+if st.session_state.role:
+    st.caption(f"Current conversation: {st.session_state.role} · You can say “switch to customer” or “switch to vendor” at any time.")
+    # Allow conversational role switching.
+    if st.session_state.chat_history:
+        last_user = next((m["content"] for m in reversed(st.session_state.chat_history) if m["role"] == "user"), "")
+        switch = detect_role(last_user)
+        if switch and any(x in norm(last_user) for x in ["switch", "change role", "i am", "i'm", "now as"]):
+            if switch != st.session_state.role:
+                st.session_state.role = switch
+                st.session_state.flow = None
 
-tabs = st.tabs(["💬 Assistant chat", "🛍️ Product catalog", "📦 Place demo order", "🧵 Vendor dashboard"])
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"], avatar="🪷" if msg["role"] == "assistant" else "🙂"):
+        st.markdown(msg["content"])
 
-with tabs[0]:
-    st.subheader("Chat with SareeSaathi")
-    mode = "OpenAI API" if configured_api_key() else "Safe demo mode"
-    st.caption(f"Current mode: {mode}. Chat does not execute transactions; use the controls in the other tabs.")
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            {"role": "assistant", "content": "Vanakkam! I can help you explore sarees or manage a shop. Try asking naturally — no special commands needed."}
-        ]
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-    prompt = st.chat_input("Type a message in your own words…")
-    if prompt:
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        # Refresh latest state before answering
-        products_now = get_products()
-        orders_now = get_orders()
-        answer, source = ai_reply(prompt, role, products_now, orders_now)
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-            st.caption(source)
-
-with tabs[1]:
-    st.subheader("Available sarees")
-    cols = st.columns(3)
-    for idx, p in enumerate(products):
-        with cols[idx % 3]:
-            st.markdown(f"### {p['name']}")
-            st.markdown(f"**{CURRENCY}{p['price']:,.0f}**")
-            st.write(f"Color: {p['color']}  ")
-            st.write(f"Category: {p['category']}")
-            st.write(f"Available: {p['stock']}")
-            st.caption(p["description"])
-            st.divider()
-
-with tabs[2]:
-    st.subheader("Book a demo order")
-    st.warning("Demo only: this records an order and reduces sample stock. It does not process payment, dispatch products, or send WhatsApp messages.")
-    if not products:
-        st.info("No products available.")
+prompt = st.chat_input("Say what you need in your own words…")
+if prompt:
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    detected = detect_role(prompt)
+    if st.session_state.role is None and detected:
+        st.session_state.role = detected
+        answer = f"Great, I'll help you as a **{detected.lower()}**. Tell me what you'd like to do, in your own words."
+    elif st.session_state.role and detected and detected != st.session_state.role and any(x in norm(prompt) for x in ["switch", "change role", "i am", "i'm", "now as"]):
+        st.session_state.role = detected
+        st.session_state.flow = None
+        answer = f"Done — we're now in **{detected.lower()}** mode. What would you like me to help with?"
     else:
-        product_options = {f"{p['name']} — {CURRENCY}{p['price']:,.0f} (stock: {p['stock']})": p for p in products}
-        selected_label = st.selectbox("Choose a saree", list(product_options.keys()))
-        selected_product = product_options[selected_label]
-        qty = st.number_input("Quantity", min_value=1, max_value=max(1, int(selected_product["stock"]) or 1), value=1, step=1)
-        with st.form("order_form"):
-            customer_name = st.text_input("Customer name")
-            phone = st.text_input("Contact number", help="Use a demo number for testing.")
-            address = st.text_area("Delivery address")
-            consent = st.checkbox("I confirm this is a test order using sample data.")
-            submitted = st.form_submit_button("Create demo order", type="primary")
-        if submitted:
-            if not customer_name.strip() or not phone.strip() or not address.strip():
-                st.error("Please fill in the name, contact number, and delivery address.")
-            elif not consent:
-                st.error("Please confirm this is a test order.")
-            else:
-                ok, message = create_order(selected_product, qty, customer_name, phone, address)
-                if ok:
-                    st.success(message)
-                    st.info("Payment status: Not processed. Do not send real payment details.")
-                    st.rerun()
-                else:
-                    st.error(message)
+        answer = handle_message(prompt)
+    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+    st.rerun()
 
-with tabs[3]:
-    st.subheader("Vendor dashboard")
-    if role != "Vendor":
-        st.info("Switch the role selector at the top to Vendor to use this dashboard.")
-    else:
-        st.markdown("#### Inventory")
-        inv = get_products()
-        for p in inv:
-            with st.expander(f"{p['name']} · {p['stock']} in stock"):
-                with st.form(f"stock_{p['id']}"):
-                    new_price = st.number_input("Price (₹)", min_value=0.0, value=float(p["price"]), step=50.0, key=f"price_{p['id']}")
-                    new_stock = st.number_input("Stock quantity", min_value=0, value=int(p["stock"]), step=1, key=f"stockqty_{p['id']}")
-                    new_description = st.text_input("Description", value=p["description"], key=f"desc_{p['id']}")
-                    save = st.form_submit_button("Save product")
-                if save:
-                    with db() as conn:
-                        conn.execute("UPDATE products SET price=?, stock=?, description=? WHERE id=?",
-                                     (float(new_price), int(new_stock), new_description.strip(), int(p["id"])))
-                    st.success("Product updated in the demo database.")
-                    st.rerun()
-        st.markdown("#### Recent orders")
-        current_orders = get_orders()
-        if not current_orders:
-            st.write("No demo orders yet.")
-        else:
-            st.dataframe([{
-                "Order ID": o["id"], "Product": o["product_name"], "Qty": o["quantity"],
-                "Customer": o["customer_name"], "Phone": o["phone"], "Address": o["address"],
-                "Status": o["status"], "Created": o["created_at"]
-            } for o in current_orders], use_container_width=True, hide_index=True)
-
-st.divider()
-st.caption("SareeSaathi AI is an early-stage demonstration. Use fictional customer details. It is not connected to WhatsApp Business, a payment gateway, or a shipping provider.")
+with st.expander("About this prototype"):
+    st.write("This is an early-stage demo with sample sarees and demo orders. Payment processing and WhatsApp messaging are not connected. Use fictional customer details.")
