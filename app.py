@@ -143,25 +143,112 @@ Recent orders: {json.dumps(order_data, ensure_ascii=False)}
         # Keep the app usable if API key/config is wrong; avoid exposing internals.
         return demo_reply(user_text, role, products, orders) + "\n\n(Using demo fallback because AI service is unavailable.)", "Demo fallback"
 
+
 def demo_reply(user_text, role, products, orders):
-    text = user_text.lower()
-    if any(word in text for word in ["product", "saree", "show", "catalog", "price", "silk", "cotton", "available"]):
-        matches = []
-        for p in products:
-            if any(k in text for k in [p["category"].lower(), p["color"].lower(), p["name"].lower().split()[0]]):
-                matches.append(p)
+    # Lightweight multilingual/transliterated keyword matching for safe demo mode.
+    text = user_text.lower().strip()
+    normalized = (
+        text.replace("sarees", "saree")
+            .replace("saris", "saree")
+            .replace("irukka", " available ")
+            .replace("irukku", " available ")
+            .replace("irukkா", " available ")
+            .replace("stock la", " stock ")
+            .replace("enna enna", " which ")
+            .replace("evlo", " price ")
+            .replace("vilai", " price ")
+            .replace("kaamikka", " show ")
+            .replace("kaatu", " show ")
+    )
+
+    # Stock/inventory requests should summarize the current catalog.
+    stock_intent = any(w in normalized for w in [
+        "stock", "inventory", "available", "what do we have", "which saree", "all saree"
+    ])
+    if role == "Vendor" and any(w in normalized for w in ["order", "sales", "customer"]):
+        return (
+            f"You have **{len(orders)} demo order(s)** recorded.\n\n"
+            "Open the Vendor dashboard to review orders and update inventory. "
+            "In demo mode, I won't modify records based only on chat."
+        )
+
+    # Detect an explicit color/product/category request.
+    color_terms = {
+        "blue": ["blue"],
+        "maroon": ["maroon"],
+        "mustard": ["mustard", "yellow"],
+        "teal": ["teal", "green"],
+        "lavender": ["lavender", "purple"],
+    }
+    requested_colors = [color for color, terms in color_terms.items()
+                        if any(term in normalized for term in terms)]
+    category_terms = {
+        "silk": ["silk", "kanchipuram"],
+        "cotton": ["cotton"],
+        "festive": ["festive", "banarasi"],
+        "printed": ["printed", "print"],
+        "party wear": ["party wear", "organza"],
+    }
+    requested_categories = [cat for cat, terms in category_terms.items()
+                            if any(term in normalized for term in terms)]
+
+    # Recognize simple budget phrasing, including "under 5000" / "below 2000".
+    import re
+    budget = None
+    match = re.search(r"(?:under|below|less than|within|budget(?: of)?|under rs\.?|under ₹)\s*₹?\s*([0-9,]+)", normalized)
+    if match:
+        try:
+            budget = float(match.group(1).replace(",", ""))
+        except ValueError:
+            budget = None
+    if budget is None:
+        match = re.search(r"(?:₹|rs\.?\s*)([0-9,]+)", normalized)
+        if match and any(w in normalized for w in ["under", "below", "budget", "less than", "within"]):
+            try:
+                budget = float(match.group(1).replace(",", ""))
+            except ValueError:
+                pass
+
+    matches = list(products)
+    if requested_colors:
+        matches = [p for p in matches if any(c in p["color"].lower() for c in requested_colors)]
+    if requested_categories:
+        matches = [p for p in matches if any(c in p["category"].lower() or c in p["name"].lower()
+                                               for c in requested_categories)]
+    if budget is not None:
+        matches = [p for p in matches if float(p["price"]) <= budget]
+
+    product_intent = any(w in normalized for w in [
+        "saree", "product", "show", "catalog", "price", "silk", "cotton",
+        "blue", "maroon", "mustard", "teal", "lavender", "available", "stock",
+        "under", "budget", "organza", "banarasi", "printed"
+    ])
+
+    if product_intent or stock_intent:
         if not matches:
-            matches = products[:4]
-        lines = [f"Here are some options from the current demo catalog:"]
-        for p in matches[:5]:
-            lines.append(f"• **{p['name']}** — {CURRENCY}{p['price']:,.0f}, {p['color']}, stock: {p['stock']}")
-        lines.append("Choose a product in the Product selection section to place a demo order.")
-        return "\n".join(lines)
-    if role == "Vendor" and any(w in text for w in ["order", "sales", "customer", "stock", "inventory"]):
-        return f"There are {len(orders)} demo order(s) recorded. Use the Vendor dashboard below to review orders and update stock. I won't change records based only on this chat in demo mode."
-    if any(w in text for w in ["buy", "order", "purchase", "delivery", "address"]):
-        return "I can help you choose a saree. Select a product in the Product selection section, then enter delivery details to create a demo order. Payment is not enabled."
-    return "I’m SareeSaathi, your conversational sales assistant. Ask me to show silk sarees, find options under ₹2,000, check available products, or help with vendor inventory. In demo mode, chat answers are rule-based; add an OpenAI API key to enable AI-powered intent understanding."
+            return "I couldn't find a matching saree in the current demo catalog. Try asking for blue, maroon, silk, cotton, or a budget such as 'under ₹3000'."
+        if not stock_intent and not requested_colors and not requested_categories and budget is None:
+            matches = matches[:5]
+        lines = ["Here are the matching sarees in the current demo catalog:"]
+        for p in matches[:10]:
+            stock_label = "In stock" if int(p["stock"]) > 0 else "Out of stock"
+            lines.append(
+                f"- **{p['name']}** — ₹{p['price']:,.0f} | Color: {p['color']} | "
+                f"Stock: {p['stock']} ({stock_label})"
+            )
+        lines.append("\nTo book one, open **Place demo order** and select the product. No payment is processed.")
+        return "\n\n".join(lines)
+
+    if any(w in normalized for w in ["buy", "order", "purchase", "delivery", "address"]):
+        return "I can help you choose a saree. Open **Product catalog**, then **Place demo order** to enter delivery details and create a demo order. Payment is not enabled."
+    return (
+        "Vanakkam! I'm SareeSaathi, your demo sales assistant. You can ask in simple English or Tamil-English, "
+        "for example:\n\n"
+        "- Which sarees are in stock?\n"
+        "- Blue saree irukka?\n"
+        "- Show silk sarees under ₹5000\n\n"
+        "This is rule-based demo mode; add an OpenAI API key to enable AI-powered intent understanding."
+    )
 
 # ---------- UI ----------
 st.markdown("""
